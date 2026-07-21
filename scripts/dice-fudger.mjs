@@ -196,7 +196,7 @@ function _installRollRigging(outcome) {
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "hideFromActiveModules", {
     name: "Hide from Active Modules",
-    hint: "If enabled, this module will be hidden from the active modules list for non-GM users.",
+    hint: "If enabled, this module's entry is removed from the Manage/View Modules list for non-GM users (players can open a read-only version of that list, not just GMs). This only hides the list entry - it does not stop a player from seeing this module is installed via the browser console (game.modules) or network requests for its files.",
     scope: "world",
     config: true,
     type: Boolean,
@@ -204,11 +204,30 @@ Hooks.once("init", () => {
   });
 });
 
-Hooks.once("ready", () => {
+/*
+ * "Hide from Active Modules" - previously implemented as a CSS class toggled on <body>, matched
+ * against the Manage Modules dialog's internal `.package.active[data-module-id="..."]` markup.
+ * That was wrong on two counts:
+ *  1. It assumed only the GM could open that dialog. Foundry's own settings sidebar template
+ *     (templates/sidebar/apps/module-management.hbs via templates/sidebar/tabs/settings.hbs)
+ *     shows the same "Manage Modules" button to every user - non-GMs just get it relabeled to
+ *     "View Modules" and a read-only, active-modules-only list. Any player can open it.
+ *  2. Tying the hide to specific internal class names is brittle across Foundry versions.
+ *
+ * Instead, hook the dialog's own render lifecycle (ApplicationV2 fires `render<ClassName>`, so
+ * this ModuleManagement app fires "renderModuleManagement" - confirmed in
+ * client/applications/api/application.mjs's `#callHooks`) and remove our own list entry by its
+ * stable `data-module-id` attribute directly from the rendered DOM. This doesn't depend on the
+ * dialog's internal class structure and keeps working even after the player uses the search box
+ * or the active/inactive filter (both of those just toggle `.hidden` on the existing <li>
+ * elements rather than re-rendering, so once the node is removed it stays gone).
+ */
+Hooks.on("renderModuleManagement", (_app, element) => {
   if (game.user?.isGM) return;
-  if (game.settings.get(MODULE_ID, "hideFromActiveModules")) {
-    document.body.classList.add("dice-fudger-hide-active-module");
-  }
+  if (!game.settings.get(MODULE_ID, "hideFromActiveModules")) return;
+  const el = element instanceof HTMLElement ? element : element?.[0];
+  const entry = el?.querySelector(`[data-module-id="${MODULE_ID}"]`);
+  entry?.remove();
 });
 
 Hooks.once("ready", async () => {
