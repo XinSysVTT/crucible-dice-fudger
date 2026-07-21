@@ -22,7 +22,9 @@
   min-width: 8rem;
 }
 
-.dice-fudger-hide-active-module .package.active[data-module-id="crucible-dice-fudger"] {
+.dice-fudger-hide-active-module .package.active[data-module-id="crucible-dice-fudger"],
+.dice-fudger-hide-active-module .module.active[data-module-id="crucible-dice-fudger"],
+.dice-fudger-hide-active-module [data-module-id="crucible-dice-fudger"] {
   display: none !important;
 }
 
