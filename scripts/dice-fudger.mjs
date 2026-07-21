@@ -200,7 +200,7 @@ Hooks.once("init", () => {
     scope: "world",
     config: true,
     type: Boolean,
-    default: false
+    default: true
   });
 });
 
