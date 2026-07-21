@@ -1,0 +1,48 @@
+/* Intentionally minimal - relies on core Foundry form-group styling */
+.dice-fudger-group-outcome-buttons {
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.dice-fudger-group-outcome-buttons .button {
+  white-space: nowrap;
+}
+.dice-fudger-has-buttons {
+  max-height: 48rem;
+  overflow-y: auto;
+}
+.dice-fudger-group-outcome-buttons {
+  background: rgba(0, 0, 0, 0.85);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0.35rem 0;
+}
+.dice-fudger-group-outcome-buttons button {
+  flex: 1 1 auto;
+  min-width: 8rem;
+}
+
+.dice-fudger-hide-active-module .package.active[data-module-id="dice-fudger"] {
+  display: none !important;
+}
+
+.dice-fudger-armed-indicator {
+  position: fixed;
+  bottom: 4.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  background: rgba(120, 20, 20, 0.92);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  font-size: var(--font-size-13, 13px);
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.6);
+}
+.dice-fudger-armed-indicator:hover {
+  background: rgba(150, 30, 30, 0.95);
+}
+
