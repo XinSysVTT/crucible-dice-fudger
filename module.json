@@ -1,5 +1,5 @@
 {
-  "id": "dice-fudger",
+  "id": "crucible-dice-fudger",
   "title": "Dice Fudger",
   "description": "Lets the GM edit individual die results on an already-rolled, not-yet-revealed chat message before showing it to the table. Works alongside Foundry's built-in Blind GM Roll + Reveal Message features.",
   "version": "0.0.1",

@@ -29,7 +29,7 @@
  *    where that private method doesn't exist.
  */
 
-const MODULE_ID = "dice-fudger";
+const MODULE_ID = "crucible-dice-fudger";
 let _pendingGroupCheckOutcome = null;
 let _pendingGroupCheckParticipantCount = null;
 let _riggedParticipantIndex = 0;
