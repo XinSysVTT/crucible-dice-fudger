@@ -67,7 +67,11 @@ function _installSingleRollRigging() {
       if (!looksLikeCrucibleCheck) return result;
       const outcome = _pendingSingleRollOutcome;
       const targetTotal = _chooseGroupOutcomeTotal(this, outcome);
-      if (targetTotal === null) return result;
+      if (targetTotal === null) {
+        console.warn("dice-fudger | roll has no dc/threshold data to force an outcome against - left unmodified.", {outcome, roll: this});
+        ui.notifications.warn(`Dice Fudger: couldn't force this roll to ${OUTCOME_LABELS[outcome] ?? outcome} - it has no DC/threshold data. The roll was left unmodified.`);
+        return result;
+      }
       const currentTotal = _evaluateRollTotal(this);
       if (currentTotal !== targetTotal) {
         const edited = _assignDiceValuesToMatchTotal(this, targetTotal);
@@ -176,7 +180,11 @@ function _installRollRigging(outcome) {
       const participantIndex = _riggedParticipantIndex++;
       const rollOutcome = participantOutcomes[participantIndex] ?? outcome;
       const targetTotal = _chooseGroupOutcomeTotal(this, rollOutcome);
-      if (targetTotal === null) return result;
+      if (targetTotal === null) {
+        console.warn("dice-fudger | a participant roll in this group check has no dc/threshold data to force an outcome against - left unmodified.", {outcome, rollOutcome, participantIndex, roll: this});
+        ui.notifications.warn(`Dice Fudger: couldn't force one of this group check's rolls to ${OUTCOME_LABELS[rollOutcome] ?? rollOutcome} - it has no DC/threshold data. That roll was left unmodified.`);
+        return result;
+      }
       const currentTotal = _evaluateRollTotal(this);
       if (currentTotal === targetTotal) return result;
       const edited = _assignDiceValuesToMatchTotal(this, targetTotal);
@@ -457,11 +465,19 @@ function _clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function _distributeSumAcrossDice(faces, targetSum) {
+/**
+ * @param {number[]} faces      Face count of each die in the pool
+ * @param {number} requestedSum The sum the caller would like the dice to add up to
+ * @returns {{values: number[], requestedSum: number, achievedSum: number}}
+ *   `achievedSum` differs from `requestedSum` when the request was outside the pool's physical
+ *   [count, sum(faces)] range and had to be clamped - callers should compare the two and warn the
+ *   GM rather than silently presenting the clamped result as if it were what was asked for.
+ */
+function _distributeSumAcrossDice(faces, requestedSum) {
   const count = faces.length;
   const minSum = count;
   const maxSum = faces.reduce((sum, f) => sum + f, 0);
-  targetSum = _clamp(targetSum, minSum, maxSum);
+  const targetSum = _clamp(requestedSum, minSum, maxSum);
 
   const values = Array(count).fill(1);
   let remaining = targetSum - minSum;
@@ -480,7 +496,7 @@ function _distributeSumAcrossDice(faces, targetSum) {
     values[i] += add;
     remaining -= add;
   }
-  return values;
+  return {values, requestedSum, achievedSum: targetSum};
 }
 
 function _buildGroupOutcomeButtons(html, message) {
@@ -656,7 +672,16 @@ function _assignDiceValuesToMatchTotal(roll, targetTotal) {
   const fixedTotal = currentTotal - currentDiceTotal;
   const targetDiceTotal = targetTotal - fixedTotal;
   const faces = entries.map((e) => e.faces);
-  const values = _distributeSumAcrossDice(faces, targetDiceTotal);
+  const {values, requestedSum, achievedSum} = _distributeSumAcrossDice(faces, targetDiceTotal);
+  if (achievedSum !== requestedSum) {
+    const achievedTotal = achievedSum + fixedTotal;
+    console.warn("dice-fudger | requested total is outside what these dice can physically produce - clamped to " +
+      "the nearest achievable value.", {requestedTotal: targetTotal, achievedTotal, faces});
+    ui.notifications.warn(
+      `Dice Fudger: the requested total (${targetTotal}) isn't possible with these dice - used the closest ` +
+      `achievable value (${achievedTotal}) instead.`
+    );
+  }
   values.forEach((value, index) => {
     const entry = entries[index];
     entry.term.results[entry.dieIndex].result = value;
@@ -693,6 +718,98 @@ function _recomputeTotalFallback(roll) {
   }
   roll._total = total;
   return total;
+}
+
+/**
+ * Look up Crucible's resource-type config (specifically whether a resource is a "reserve" pool,
+ * which flips the sign of damage against it - see CrucibleAction##resolveEventStream,
+ * module/models/action.mjs line ~2018: `cfg.type === "reserve" ? -1 : 1`) from whichever global
+ * this Crucible build happens to expose it on. Best-effort: if it can't be found, this assumes
+ * "not reserve" (the common case - health/morale) and warns, rather than throwing.
+ * @param {string} resource
+ * @returns {boolean}
+ */
+function _isReserveResourceType(resource) {
+  const cfg = globalThis.SYSTEM?.RESOURCES?.[resource]
+    ?? CONFIG.SYSTEM?.RESOURCES?.[resource]
+    ?? game.system?.SYSTEM?.RESOURCES?.[resource]
+    ?? game.system?.config?.RESOURCES?.[resource]
+    ?? null;
+  if (!cfg) {
+    console.warn(`dice-fudger | couldn't find Crucible's resource config for "${resource}" - assuming it isn't a ` +
+      "reserve pool. If it actually is, the confirmed damage sign for this fudge may be inverted.");
+    return false;
+  }
+  return cfg.type === "reserve";
+}
+
+/**
+ * Mirror the roll-damage branch of CrucibleAction##resolveEventStream (module/models/action.mjs line ~2011) for a
+ * single roll, using only the fields available directly on the (now-fudged) roll itself:
+ *
+ *   const resource = damage.resource ?? "health";
+ *   intended[resource] = (damage.total ?? 0) * (restoration ? 1 : -1) * (cfg.type === "reserve" ? -1 : 1);
+ *
+ * This is what Crucible itself uses to compute the resource delta it freezes into
+ * `message.flags.crucible.events[].resources` at the moment an action is first used - BEFORE any GM fudge can
+ * happen. Confirming an action later never re-runs that computation; it reads the frozen `resources` array
+ * verbatim (CrucibleAction##applyEvents, line ~2663), so fixing `roll.data.damage.total` alone (which is all
+ * `resolveDamage()` does) is not enough - the frozen flag data has to be corrected too, or Confirm applies the
+ * pre-fudge amount. That's the root cause of damage not updating when a roll is fudged after its message exists.
+ * @param {Roll} roll   A roll whose `resolveDamage()` has already been re-run (so `roll.data.damage` is current)
+ * @returns {{resource: string, delta: number, damageType: string|undefined, restoration: boolean}|null}
+ *   null if this roll doesn't carry (non-harmless) damage data at all
+ */
+function _recomputeCrucibleEventResourceForRoll(roll) {
+  const damage = roll?.data?.damage;
+  if (!damage || damage.harmless) return null;
+  const resource = damage.resource ?? "health";
+  const restoration = !!damage.restoration;
+  const isReserve = _isReserveResourceType(resource);
+  const total = Number(damage.total) || 0;
+  const delta = total * (restoration ? 1 : -1) * (isReserve ? -1 : 1);
+  return {resource, delta, damageType: damage.type, restoration};
+}
+
+/**
+ * Given a message's current `flags.crucible.events` array, return a corrected copy that reflects a fudged roll's
+ * new damage total, or the same array unchanged if there's nothing to correct.
+ *
+ * Deliberately conservative: Crucible's real #resolveEventStream computes the frozen `resources` by simulating the
+ * delta against an actor clone (`actor.alterResources(..., {commit: false, constraints})`), which can apply
+ * resistances, clamp against current resource values, and overflow into a second linked pool. This module has no
+ * access to that private simulation (or the `resourceConstraints` it used), so it only handles the common case -
+ * an event whose frozen `resources` is exactly the one entry the roll's own damage produced, with no overflow. If
+ * an event's frozen data looks more complex than that (more than one resource entry), this leaves it untouched and
+ * warns, rather than guessing and silently producing a wrong number.
+ * @param {object[]} events    The message's current (possibly already-corrected-once) events array
+ * @param {ChatMessage} message
+ * @param {Roll} roll          The roll that was just fudged and re-resolved
+ * @param {{changed: boolean}} tracker  Set .changed = true if a correction was made
+ * @returns {object[]}
+ */
+function _applyFudgedEventResources(events, message, roll, tracker) {
+  if (!Array.isArray(events) || !events.length) return events;
+  const rollIndex = message.rolls?.indexOf(roll);
+  if (rollIndex == null || rollIndex < 0) return events;
+  const recomputed = _recomputeCrucibleEventResourceForRoll(roll);
+  if (!recomputed) return events; // no (non-harmless) damage on this roll - nothing to correct here
+  return events.map((event) => {
+    if (event?.rollIndex !== rollIndex) return event;
+    const resources = Array.isArray(event.resources) ? event.resources : [];
+    if (resources.length > 1) {
+      console.warn("dice-fudger | this roll's confirmed damage event has more than one recorded resource change " +
+        "(likely pool overflow or a linked resource) from Crucible's own resolution - leaving " +
+        "message.flags.crucible.events untouched for it. Confirmed damage/healing for this event may still " +
+        "reflect the PRE-fudge amount.", {rollIndex, resources});
+      ui.notifications.warn("Dice Fudger: this roll's damage involves more than one resource (e.g. pool " +
+        "overflow) - the fudge to the roll total was applied, but the confirmed damage amount could not be " +
+        "safely corrected and may still show the original value.");
+      return event;
+    }
+    tracker.changed = true;
+    return {...event, resources: [recomputed]};
+  });
 }
 
 /**
@@ -870,7 +987,16 @@ class DiceFudger {
 
     for (const roll of touchedRolls) await _reresolveRoll(roll);
 
-    await message.update({rolls: message.rolls.map((roll) => typeof roll.toJSON === "function" ? roll.toJSON() : roll)}, {diff: false});
+    const tracker = {changed: false};
+    let events = message.flags?.crucible?.events;
+    for (const roll of touchedRolls) {
+      events = _applyFudgedEventResources(events, message, roll, tracker);
+    }
+
+    const updateData = {rolls: message.rolls.map((roll) => typeof roll.toJSON === "function" ? roll.toJSON() : roll)};
+    if (tracker.changed) updateData["flags.crucible.events"] = events;
+
+    await message.update(updateData, {diff: false});
     ui.notifications.info("Roll fudged. Use Foundry's \"Reveal Message\" option when you're ready to show it.");
   }
 
@@ -883,15 +1009,21 @@ class DiceFudger {
     }
 
     if (((outcome === "success") && (rolls.length < 3)) || ((outcome === "failure") && (rolls.length < 2))) {
-      console.warn(`dice-fudger | a plain "${outcome}" aggregate isn't reachable with only ${rolls.length} participant(s) under Crucible's own aggregate formula - the group card will read as critical instead, which is the closest achievable result.`);
+      const msg = `A plain "${OUTCOME_LABELS[outcome] ?? outcome}" group result isn't reachable with only ${rolls.length} participant(s) under Crucible's own aggregate formula - the group card will read as critical instead, which is the closest achievable result.`;
+      console.warn(`dice-fudger | ${msg}`);
+      if (!silent) ui.notifications.warn(`Dice Fudger: ${msg}`);
     }
     const participantOutcomes = _computeParticipantOutcomes(outcome, rolls.length);
     const changedRolls = new Set();
     const rollsNeedingReresolve = new Set();
+    let unresolvableCount = 0;
     rolls.forEach((roll, i) => {
       const rollOutcome = participantOutcomes[i] ?? outcome;
       const targetTotal = _chooseGroupOutcomeTotal(roll, rollOutcome);
-      if (targetTotal === null) return;
+      if (targetTotal === null) {
+        unresolvableCount++;
+        return;
+      }
       const currentTotal = _evaluateRollTotal(roll);
       console.debug("dice-fudger | group outcome", {outcome, rollOutcome, targetTotal, currentTotal, roll});
       if (currentTotal === targetTotal) return;
@@ -905,6 +1037,12 @@ class DiceFudger {
       }
     });
 
+    if (unresolvableCount > 0) {
+      const msg = `${unresolvableCount} of ${rolls.length} participant roll(s) had no dc/threshold data to force an outcome against and were left unmodified.`;
+      console.warn(`dice-fudger | ${msg}`);
+      if (!silent) ui.notifications.warn(`Dice Fudger: ${msg}`);
+    }
+
     if (!changedRolls.size) {
       if (!silent) ui.notifications.info("Group outcome was already at the requested result.");
       return true;
@@ -914,9 +1052,16 @@ class DiceFudger {
       await _reresolveRoll(roll);
     }
 
+    const tracker = {changed: false};
+    let events = message.flags?.crucible?.events;
+    for (const roll of rollsNeedingReresolve) {
+      events = _applyFudgedEventResources(events, message, roll, tracker);
+    }
+
     const updateData = {
       rolls: message.rolls.map((roll) => typeof roll.toJSON === "function" ? roll.toJSON() : roll)
     };
+    if (tracker.changed) updateData["flags.crucible.events"] = events;
     let content = null;
     try {
       content = await _renderGroupCheckContent(message);
