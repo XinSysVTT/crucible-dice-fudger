@@ -210,6 +210,15 @@ Hooks.once("init", () => {
     type: Boolean,
     default: true
   });
+
+  game.settings.register(MODULE_ID, "showActionOutcomeButtons", {
+    name: "Show Force Outcome Buttons on Action Cards",
+    hint: "If enabled, adds Force Critical Success / Force Success / Force Failure / Force Critical Failure buttons underneath the Confirm button on an action's pending chat card (e.g. a weapon Strike). This lets the GM fudge that action's already-rolled dice in place before confirming it, without needing the chat message context menu or the Fudge Next Roll macro. The buttons only appear on cards that haven't been confirmed yet, and only edit the roll - you still click Confirm yourself when you're ready to apply it.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: false
+  });
 });
 
 /*
@@ -401,11 +410,34 @@ Hooks.on("getChatMessageContextOptions", (message, options) => {
   });
 });
 
-Hooks.on("renderChatMessage", (app, html) => {
+/**
+ * Foundry v13+ replaced the legacy jQuery `renderChatMessage` hook with `renderChatMessageHTML`,
+ * which fires with a raw HTMLElement instead of a jQuery collection (and, as of this module's
+ * targeted v14, `renderChatMessage` no longer fires at all). Handle both hooks and both calling
+ * conventions so the button-injection code below - which uses jQuery's .find()/.after()/etc
+ * throughout - always gets a jQuery object to work with.
+ * @param {HTMLElement|JQuery} html
+ * @returns {JQuery}
+ */
+function _toJQuery(html) {
+  return html?.jquery ? html : $(html);
+}
+
+function _onRenderChatMessage(app, html) {
   if (!game.user.isGM) return;
-  if (!_isGroupCheckMessage(app.message)) return;
-  _buildGroupOutcomeButtons(html, app.message);
-});
+  const message = app.message ?? app; // v13+ passes the ChatMessage directly, not an app wrapper
+  html = _toJQuery(html);
+  if (_isGroupCheckMessage(message)) {
+    _buildGroupOutcomeButtons(html, message);
+    return;
+  }
+  if (game.settings.get(MODULE_ID, "showActionOutcomeButtons") && _isPendingActionMessage(message)) {
+    _buildActionOutcomeButtons(html, message);
+  }
+}
+
+Hooks.on("renderChatMessage", _onRenderChatMessage);
+Hooks.on("renderChatMessageHTML", _onRenderChatMessage);
 
 /**
  * Support both the raw-element (v13/v14) and jQuery (legacy) context-menu calling conventions.
@@ -499,26 +531,47 @@ function _distributeSumAcrossDice(faces, requestedSum) {
   return {values, requestedSum, achievedSum: targetSum};
 }
 
-function _buildGroupOutcomeButtons(html, message) {
-  if (html.find(".dice-fudger-group-outcome-buttons").length) return;
-  const buttonBar = $("<div class=\"dice-fudger-group-outcome-buttons flexrow\"></div>");
-  const buttons = [
-    {action: "criticalSuccess", label: "Force Group Critical Success"},
-    {action: "success", label: "Force Group Success"},
-    {action: "failure", label: "Force Group Failure"},
-    {action: "criticalFailure", label: "Force Group Critical Failure"}
-  ];
-  for (const button of buttons) {
+const FORCE_OUTCOME_BUTTONS = [
+  {action: "criticalSuccess", label: "Critical Success"},
+  {action: "success", label: "Success"},
+  {action: "failure", label: "Failure"},
+  {action: "criticalFailure", label: "Critical Failure"}
+];
+
+/**
+ * Build a "force outcome" button bar (4 buttons: crit success / success / failure / crit
+ * failure). Shared by the group-check bar and the pending-action-card bar, which differ only in
+ * their CSS class, label prefix, click handler, and where they get inserted into the card - all
+ * of that is left to the caller.
+ * @param {string} cssClass    Wrapper class, also used as the "already built" dedupe check by callers
+ * @param {string} labelPrefix Prepended to each button's label, e.g. "Force Group " or "Force "
+ * @param {(action: string) => Promise<void>} onClick
+ * @returns {JQuery}
+ */
+function _buildOutcomeButtonBar(cssClass, labelPrefix, onClick) {
+  const buttonBar = $(`<div class="${cssClass} flexrow"></div>`);
+  for (const button of FORCE_OUTCOME_BUTTONS) {
     buttonBar.append(
-      $(`<button type="button" class="button">${button.label}</button>`).data("diceFudgerAction", button.action)
+      $(`<button type="button" class="button dice-fudger-outcome-${button.action}" data-outcome="${button.action}">${labelPrefix}${button.label}</button>`)
+        .data("diceFudgerAction", button.action)
     );
   }
   buttonBar.on("click", "button", async (event) => {
     event.preventDefault();
     const action = $(event.currentTarget).data("diceFudgerAction");
     if (!action) return;
-    await DiceFudger.forceGroupOutcome(message, action);
+    await onClick(action);
   });
+  return buttonBar;
+}
+
+function _buildGroupOutcomeButtons(html, message) {
+  if (html.find(".dice-fudger-group-outcome-buttons").length) return;
+  const buttonBar = _buildOutcomeButtonBar(
+    "dice-fudger-group-outcome-buttons",
+    "Force Group ",
+    (action) => DiceFudger.forceGroupOutcome(message, action)
+  );
 
   const content = html.find(".message-content").first();
   if (!content.length) return;
@@ -526,6 +579,64 @@ function _buildGroupOutcomeButtons(html, message) {
   content.css({overflowY: "auto", maxHeight: "calc(100vh - 12rem)"});
   buttonBar.css({position: "sticky", bottom: 0, zIndex: 2, background: "rgba(0,0,0,0.95)", padding: "0.35rem 0"});
   content.append(buttonBar);
+}
+
+/**
+ * Whether this message is a not-yet-confirmed Crucible action-use card (e.g. a weapon Strike),
+ * as opposed to a confirmed one or some other message type entirely. Matches the same
+ * `flags.crucible.confirmed` gate Crucible itself uses to decide whether to show its own Confirm
+ * button (see CrucibleAction#confirm, which flips this flag once the GM confirms).
+ * @param {ChatMessage} message
+ * @returns {boolean}
+ */
+function _isPendingActionMessage(message) {
+  const flags = message?.flags?.crucible ?? message?.data?.flags?.crucible;
+  if (!flags || !("action" in flags)) return false;
+  if (flags.confirmed !== false) return false; // already confirmed, or not an action that tracks confirmation
+  return !!message.rolls?.length;
+}
+
+/**
+ * Locate the card's own "Confirm" button in the rendered DOM. Crucible doesn't expose a stable
+ * public API for this. Crucible renders it as `<button class="confirm ...">`, so that's tried
+ * first, then the conventional `data-action="confirm"` attribute (matching how Crucible wires
+ * some of its other card buttons, e.g. "reverse", "expand"), and finally falls back to matching
+ * the button by its visible text in case a future Crucible version renames both.
+ * @param {JQuery} html
+ * @returns {JQuery} A jQuery collection with 0 or 1 elements
+ */
+function _findConfirmButton(html) {
+  let btn = html.find("button.confirm");
+  if (btn.length) return btn.first();
+  btn = html.find('[data-action="confirm"]');
+  if (btn.length) return btn.first();
+  btn = html.find("button, a.button").filter((_i, el) => $(el).text().trim().toLowerCase() === "confirm");
+  return btn.first();
+}
+
+function _buildActionOutcomeButtons(html, message) {
+  if (html.find(".dice-fudger-action-outcome-buttons").length) return;
+  const confirmButton = _findConfirmButton(html);
+  if (!confirmButton.length) return;
+
+  const buttonBar = _buildOutcomeButtonBar(
+    "dice-fudger-action-outcome-buttons",
+    "Force ",
+    (action) => DiceFudger.forceActionOutcome(message, action)
+  );
+
+  // Insert as a new row directly under Confirm. If Confirm sits in its own footer/wrapper *inside
+  // the card*, insert after that wrapper instead of after the bare button so the bar doesn't end
+  // up squeezed onto the same flex row as Confirm. But if Confirm is a direct child of the message
+  // root (the <li class="chat-message">... element `html` itself wraps), climbing to the parent
+  // would mean inserting the bar as a sibling of the whole message in the chat log - a stray node
+  // Foundry won't render. In that case, insert directly after the bare button instead.
+  const messageRoot = html[0];
+  const wrapper = confirmButton.parent();
+  const wrapperIsMessageRoot = wrapper.length && messageRoot && wrapper[0] === messageRoot;
+  const target = (wrapper.length && !wrapperIsMessageRoot && !wrapper.is("body,html")) ? wrapper : confirmButton;
+  buttonBar.css({flex: "1 1 100%", width: "100%"});
+  target.after(buttonBar);
 }
 
 function _parseCheckMetadata(roll) {
@@ -962,17 +1073,45 @@ class DiceFudger {
       content.append(field.toFormGroup({classes: ["slim"]}, {value: d.value, autofocus: i === 0}));
     });
 
-    let formData;
+    // Offer the same "Force Outcome" shortcuts as the chat-card buttons, right in the dialog,
+    // for the same messages the chat card would show them on. These are wired as real DialogV2
+    // buttons (not appended into `content` and wired by hand) so Foundry's own button/close
+    // lifecycle handles them - clicking one always closes the dialog, which matters here: forcing
+    // an outcome updates the message's rolls directly, but the die fields above were populated
+    // from a snapshot taken before that; if the dialog stayed open and the GM then hit Save, the
+    // stale field values would silently overwrite the just-forced result.
+    const showForceButtons = game.settings.get(MODULE_ID, "showActionOutcomeButtons")
+      && _isPendingActionMessage(message);
+
+    let result;
     try {
-      formData = await foundry.applications.api.DialogV2.input({
+      result = await foundry.applications.api.DialogV2.wait({
         window: {title: `Fudge Roll - ${message.speaker?.alias ?? "Chat Message"}`},
         content,
-        ok: {label: "Save"}
+        buttons: [
+          {
+            action: "save",
+            label: "Save",
+            icon: "fa-solid fa-check",
+            default: true,
+            callback: (_event, button) => new foundry.applications.ux.FormDataExtended(button.form).object
+          },
+          ...(showForceButtons ? FORCE_OUTCOME_BUTTONS.map((b) => ({
+            action: `force-${b.action}`,
+            label: `Force ${b.label}`,
+            callback: () => ({dice_fudger_force: b.action})
+          })) : [])
+        ]
       });
     } catch (err) {
       return; // cancelled
     }
-    if (!formData) return;
+    if (!result) return;
+    if (result.dice_fudger_force) {
+      await DiceFudger.forceActionOutcome(message, result.dice_fudger_force);
+      return;
+    }
+    const formData = result;
 
     const touchedRolls = new Set();
     dice.forEach((d, i) => {
@@ -1078,6 +1217,77 @@ class DiceFudger {
       criticalFailure: "Critical Failure"
     }[outcome] ?? "Outcome";
     ui.notifications.info(`Forced group outcome: ${label}.`);
+  }
+
+  /**
+   * Force every roll on a pending (not-yet-confirmed) Crucible action-use card - e.g. a weapon
+   * Strike, a cast spell's save - to a given outcome bracket. Unlike forceGroupOutcome, this does
+   * not distribute participants across brackets (there's no group aggregate formula to satisfy
+   * here) and it doesn't need to regenerate message.content: Crucible's action card, like its
+   * other roll cards, reads success/failure and (for AttackRoll) the Hit/Miss badge and damage
+   * total live off the roll data on every render, so fixing the roll (and, for AttackRoll,
+   * re-running resolveDamage via _reresolveRoll) is all that's needed - the same as the base
+   * "Fudge Roll" dialog. This does NOT click Confirm; the GM still does that manually once ready.
+   * @param {ChatMessage} message
+   * @param {string} outcome  "criticalSuccess"|"success"|"failure"|"criticalFailure"
+   * @param {object} [options]
+   * @param {boolean} [options.silent=false]
+   * @returns {Promise<boolean>} false if there was nothing to force an outcome on
+   */
+  static async forceActionOutcome(message, outcome, {silent = false} = {}) {
+    console.debug("dice-fudger | forceActionOutcome called", {messageId: message.id, outcome, rollCount: message.rolls?.length});
+    const rolls = message.rolls ?? [];
+    if (!rolls.length) {
+      if (!silent) ui.notifications.warn("No rolls found on this action to force an outcome for.");
+      return false;
+    }
+
+    const changedRolls = new Set();
+    const rollsNeedingReresolve = new Set();
+    let unresolvableCount = 0;
+    for (const roll of rolls) {
+      const targetTotal = _chooseGroupOutcomeTotal(roll, outcome);
+      if (targetTotal === null) {
+        unresolvableCount++;
+        continue;
+      }
+      const currentTotal = _evaluateRollTotal(roll);
+      if (currentTotal === targetTotal) continue;
+      const edited = _assignDiceValuesToMatchTotal(roll, targetTotal);
+      if (!edited && roll._total !== targetTotal) roll._total = targetTotal;
+      changedRolls.add(roll);
+      if (edited || typeof roll.resolveDamage === "function") rollsNeedingReresolve.add(roll);
+    }
+
+    if (unresolvableCount > 0) {
+      const msg = `${unresolvableCount} of ${rolls.length} roll(s) on this action had no dc/threshold data to force an outcome against and were left unmodified.`;
+      console.warn(`dice-fudger | ${msg}`);
+      if (!silent) ui.notifications.warn(`Dice Fudger: ${msg}`);
+    }
+
+    if (!changedRolls.size) {
+      if (!silent) ui.notifications.info("This action's outcome was already at the requested result.");
+      return true;
+    }
+
+    for (const roll of rollsNeedingReresolve) {
+      await _reresolveRoll(roll);
+    }
+
+    const tracker = {changed: false};
+    let events = message.flags?.crucible?.events;
+    for (const roll of rollsNeedingReresolve) {
+      events = _applyFudgedEventResources(events, message, roll, tracker);
+    }
+
+    const updateData = {
+      rolls: message.rolls.map((roll) => typeof roll.toJSON === "function" ? roll.toJSON() : roll)
+    };
+    if (tracker.changed) updateData["flags.crucible.events"] = events;
+    await message.update(updateData, {diff: false});
+
+    ui.notifications.info(`Forced action outcome: ${OUTCOME_LABELS[outcome] ?? outcome}.`);
+    return true;
   }
 }
 
