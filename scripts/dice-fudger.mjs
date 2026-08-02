@@ -60,12 +60,27 @@ function _installSingleRollRigging() {
   const originalEvaluate = Roll.prototype.evaluate;
   Roll.prototype.evaluate = async function(...args) {
     const result = await originalEvaluate.apply(this, args);
-    if (!_pendingSingleRollOutcome) return result;
+    const armed = _pendingSingleRollOutcome;
+    if (!armed) return result;
+
+    // IMPORTANT: qualification checks (dc data, and actor match if a specific actor was
+    // targeted) must happen BEFORE the try/finally below, not inside it. `return` inside a try
+    // block still runs its finally clause first - so an early `return result` from inside the
+    // try was disarming _pendingSingleRollOutcome on the very first Roll.evaluate() of ANY kind
+    // (a damage roll, an NPC's save, another player's check, initiative, etc.), not just on a
+    // roll that actually matched. That's why "fudge next roll" often silently did nothing: with
+    // more than one person at the table, something else almost always rolls first and ate the
+    // arming before the intended roll ever happened.
+    const data = this.data ?? this.options?.data;
+    const looksLikeCrucibleCheck = data && ("dc" in data || "dc" in (data.data ?? {}));
+    if (!looksLikeCrucibleCheck) return result;
+    if (armed.actorId) {
+      const rollActorId = this.data?.actorId ?? this.options?.data?.actorId ?? null;
+      if (rollActorId !== armed.actorId) return result; // not the targeted player - leave armed
+    }
+
+    const outcome = armed.outcome;
     try {
-      const data = this.data ?? this.options?.data;
-      const looksLikeCrucibleCheck = data && ("dc" in data || "dc" in (data.data ?? {}));
-      if (!looksLikeCrucibleCheck) return result;
-      const outcome = _pendingSingleRollOutcome;
       const targetTotal = _chooseGroupOutcomeTotal(this, outcome);
       if (targetTotal === null) {
         console.warn("dice-fudger | roll has no dc/threshold data to force an outcome against - left unmodified.", {outcome, roll: this});
@@ -78,13 +93,12 @@ function _installSingleRollRigging() {
         if (!edited && this._total !== targetTotal) this._total = targetTotal;
         if (edited || typeof this.resolveDamage === "function") await _reresolveRoll(this);
       }
-      console.debug("dice-fudger | rigged next single roll", {outcome, targetTotal, currentTotal});
+      console.debug("dice-fudger | rigged next single roll", {outcome, targetTotal, currentTotal, actorId: armed.actorId});
     } catch (err) {
       console.warn("dice-fudger | failed to rig next single roll:", err);
     } finally {
-      // Consume the arming after the first qualifying roll is *attempted*, success or not - a
-      // roll that doesn't have `dc` (e.g. a damage roll) is skipped above without reaching here,
-      // so this only fires (and disarms) on the actual check roll we were waiting for.
+      // Only reached once a roll actually qualified (right shape, right actor) and was
+      // attempted - success or not - so this now only fires on the roll we were waiting for.
       _pendingSingleRollOutcome = null;
       _updateArmedIndicator();
     }
@@ -102,6 +116,8 @@ function _updateArmedIndicator() {
     el?.remove();
     return;
   }
+  const {outcome, actorId} = _pendingSingleRollOutcome;
+  const targetName = actorId ? (game.actors?.get(actorId)?.name ?? "unknown actor") : null;
   if (!el) {
     el = document.createElement("div");
     el.id = "dice-fudger-armed-indicator";
@@ -113,7 +129,7 @@ function _updateArmedIndicator() {
     });
     document.body.appendChild(el);
   }
-  el.textContent = `🎲 Next roll forced: ${OUTCOME_LABELS[_pendingSingleRollOutcome] ?? _pendingSingleRollOutcome} (click to cancel)`;
+  el.textContent = `🎲 Next ${targetName ? `${targetName} roll` : "roll"} forced: ${OUTCOME_LABELS[outcome] ?? outcome} (click to cancel)`;
 }
 
 /**
@@ -249,25 +265,40 @@ Hooks.on("renderModuleManagement", (_app, element) => {
 
 Hooks.once("ready", async () => {
   if (!game.user?.isGM) return;
-  const flagPath = `flags.${MODULE_ID}.isFudgeNextRollMacro`;
-  const existing = game.macros.find(m => foundry.utils.getProperty(m, flagPath));
-  if (existing) return;
-  try {
-    await Macro.create({
-      name: "Fudge Next Roll",
-      type: "script",
-      img: "icons/svg/d20-black.svg",
-      command: "DiceFudger.promptArmNextRoll();",
-      // Explicit, rather than relying on the schema default: only the GM (and other GM accounts,
-      // which always bypass ownership checks) can see or run this in the Macro Directory.
-      ownership: {default: CONST.DOCUMENT_OWNERSHIP_LEVELS.NONE},
-      flags: {[MODULE_ID]: {isFudgeNextRollMacro: true}}
-    });
-    console.log("dice-fudger | created \"Fudge Next Roll\" macro in the Macro Directory - drag it onto your hotbar.");
-  } catch (err) {
-    console.warn("dice-fudger | failed to auto-create the Fudge Next Roll macro:", err);
+  const macrosToEnsure = [
+    {
+      flag: "isFudgeNextRollMacro",
+      name: "Fudge Next Roll (Anyone)",
+      command: "DiceFudger.promptArmNextRoll();"
+    },
+    {
+      flag: "isFudgeNextPlayerRollMacro",
+      name: "Fudge Next Roll (Choose Player)",
+      command: "DiceFudger.promptArmNextRollForPlayer();"
+    }
+  ];
+  for (const {flag, name, command} of macrosToEnsure) {
+    const flagPath = `flags.${MODULE_ID}.${flag}`;
+    const existing = game.macros.find(m => foundry.utils.getProperty(m, flagPath));
+    if (existing) continue;
+    try {
+      await Macro.create({
+        name,
+        type: "script",
+        img: "icons/svg/d20-black.svg",
+        command,
+        // Explicit, rather than relying on the schema default: only the GM (and other GM
+        // accounts, which always bypass ownership checks) can see or run this in the Macro Directory.
+        ownership: {default: CONST.DOCUMENT_OWNERSHIP_LEVELS.NONE},
+        flags: {[MODULE_ID]: {[flag]: true}}
+      });
+      console.log(`dice-fudger | created "${name}" macro in the Macro Directory - drag it onto your hotbar.`);
+    } catch (err) {
+      console.warn(`dice-fudger | failed to auto-create the "${name}" macro:`, err);
+    }
   }
 });
+
 
 Hooks.once("ready", () => {
   const GroupCheck = _getGroupCheckClass();
@@ -436,7 +467,15 @@ function _onRenderChatMessage(app, html) {
   }
 }
 
-Hooks.on("renderChatMessage", _onRenderChatMessage);
+// Only hook the modern "renderChatMessageHTML" hook. Foundry calls the deprecated
+// "renderChatMessage" hook internally for back-compat ONLY when something has a listener
+// registered on it - registering here was itself what triggered the "renderChatMessage hook is
+// deprecated" warning spam on every chat render. Worse, both hooks then fired for the same
+// render, so _onRenderChatMessage ran twice per message against two different html references,
+// which could race with the ".dice-fudger-*-buttons already built" dedupe check and leave the
+// button bar appended to the wrong (or a since-discarded) copy of the card - the likeliest cause
+// of the buttons/context-menu intermittently not working. v13/v14 both fire
+// renderChatMessageHTML, so the legacy hook was never actually needed here.
 Hooks.on("renderChatMessageHTML", _onRenderChatMessage);
 
 /**
@@ -959,12 +998,17 @@ async function _reresolveRoll(roll) {
 
 class DiceFudger {
   /**
-   * Arm the next qualifying roll (any Roll with a `dc` in its data - skill checks, saves,
-   * attack rolls, etc.) to be forced into the given outcome bracket, whenever it next happens.
-   * Callable directly from a macro, e.g. `DiceFudger.armNextRoll("success")`.
+   * Arm a roll to be forced into the given outcome bracket the next time it happens. By default
+   * this matches the very next qualifying roll (any Roll with `dc` in its data) from ANYONE - if
+   * your table has other rolls likely to land first (other players, NPCs, damage rolls), pass
+   * `actorId` to wait specifically for that actor's next qualifying roll instead, ignoring
+   * everyone else's in the meantime. Callable directly from a macro, e.g.
+   * `DiceFudger.armNextRoll("success")` or `DiceFudger.armNextRoll("success", {actorId: "..."})`.
    * @param {"criticalSuccess"|"success"|"failure"|"criticalFailure"} outcome
+   * @param {object} [options]
+   * @param {string|null} [options.actorId] Only fudge this actor's next qualifying roll
    */
-  static armNextRoll(outcome) {
+  static armNextRoll(outcome, {actorId = null} = {}) {
     if (!game.user?.isGM) {
       ui.notifications.warn("Only the GM can fudge rolls.");
       return;
@@ -974,14 +1018,18 @@ class DiceFudger {
       return;
     }
     _installSingleRollRigging();
-    _pendingSingleRollOutcome = outcome;
+    _pendingSingleRollOutcome = {outcome, actorId: actorId || null};
     _updateArmedIndicator();
-    ui.notifications.info(`Dice Fudger: next roll will be forced to ${OUTCOME_LABELS[outcome]}.`);
+    const targetName = actorId ? (game.actors?.get(actorId)?.name ?? "the selected actor") : null;
+    ui.notifications.info(`Dice Fudger: next ${targetName ? `roll from ${targetName}` : "roll"} will be forced to ${OUTCOME_LABELS[outcome]}.`);
   }
 
   /**
-   * Open a small dialog to pick the outcome for the next roll, or cancel an already-armed fudge.
-   * This is what the auto-created "Fudge Next Roll" macro calls.
+   * Open a small dialog to pick the outcome for the very next qualifying roll from ANYONE -
+   * whoever rolls first is who gets fudged - or cancel an already-armed fudge. This is what the
+   * auto-created "Fudge Next Roll (Anyone)" macro calls. Use promptArmNextRollForPlayer instead
+   * if you want to wait specifically for one player's roll regardless of what anyone else rolls
+   * in the meantime.
    * @returns {Promise<void>}
    */
   static async promptArmNextRoll() {
@@ -991,8 +1039,8 @@ class DiceFudger {
     }
     const outcome = await new Promise((resolve) => {
       new Dialog({
-        title: "Fudge Next Roll",
-        content: "<p>Force the next qualifying roll (skill check, save, attack, etc.) to a specific outcome.</p>",
+        title: "Fudge Next Roll (Anyone)",
+        content: "<p>Force the very next qualifying roll (skill check, save, attack, etc.) from anyone at the table to a specific outcome.</p>",
         buttons: {
           criticalSuccess: {label: "Critical Success", callback: () => resolve("criticalSuccess")},
           success: {label: "Success", callback: () => resolve("success")},
@@ -1011,6 +1059,61 @@ class DiceFudger {
       return;
     }
     if (outcome) DiceFudger.armNextRoll(outcome);
+  }
+
+  /**
+   * Open a dialog to pick BOTH a specific player character and an outcome, and arm the fudge to
+   * wait only for that actor's next qualifying roll - any other roll that happens in the
+   * meantime (another player, an NPC, a damage roll) is ignored and left completely untouched,
+   * and does not consume the arming. This is what the auto-created "Fudge Next Roll (Choose
+   * Player)" macro calls.
+   * @returns {Promise<void>}
+   */
+  static async promptArmNextRollForPlayer() {
+    if (!game.user?.isGM) {
+      ui.notifications.warn("Only the GM can fudge rolls.");
+      return;
+    }
+    const actors = game.actors
+      .filter((a) => a.hasPlayerOwner)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (!actors.length) {
+      ui.notifications.warn("Dice Fudger: no player-owned characters found to target.");
+      return;
+    }
+    const actorOptions = actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("");
+    const content = `
+      <p>Force a specific player's next qualifying roll (skill check, save, attack, etc.) to a chosen outcome. Rolls from anyone else are ignored.</p>
+      <div class="form-group">
+        <label for="dice-fudger-target-actor">Player:</label>
+        <select id="dice-fudger-target-actor" name="targetActor" autofocus>
+          ${actorOptions}
+        </select>
+      </div>
+    `;
+    const readTarget = (html) => _toJQuery(html).find("#dice-fudger-target-actor").val() || null;
+    const result = await new Promise((resolve) => {
+      new Dialog({
+        title: "Fudge Next Roll (Choose Player)",
+        content,
+        buttons: {
+          criticalSuccess: {label: "Critical Success", callback: (html) => resolve({outcome: "criticalSuccess", actorId: readTarget(html)})},
+          success: {label: "Success", callback: (html) => resolve({outcome: "success", actorId: readTarget(html)})},
+          failure: {label: "Failure", callback: (html) => resolve({outcome: "failure", actorId: readTarget(html)})},
+          criticalFailure: {label: "Critical Failure", callback: (html) => resolve({outcome: "criticalFailure", actorId: readTarget(html)})},
+          cancel: {label: "Cancel Armed Fudge", callback: () => resolve("__cancel__")}
+        },
+        default: "success",
+        close: () => resolve(null)
+      }).render(true);
+    });
+    if (result === "__cancel__") {
+      _pendingSingleRollOutcome = null;
+      _updateArmedIndicator();
+      ui.notifications.info("Dice Fudger: next-roll fudge cancelled.");
+      return;
+    }
+    if (result) DiceFudger.armNextRoll(result.outcome, {actorId: result.actorId});
   }
 
   static async promptPreRollOutcome() {
