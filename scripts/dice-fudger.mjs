@@ -526,6 +526,34 @@ function _getEditableDiceFromRoll(roll) {
   return entries;
 }
 
+/**
+ * Build a human-readable "who this roll belongs to" label (e.g. "Aria → Goblin Archer") so the
+ * Fudge Roll dialog can identify each roll by actor/target instead of just its position in
+ * `message.rolls` - that index is an internal array order and has no guaranteed relationship to
+ * the order targets are listed on the rendered chat card, which is what made multi-target attacks
+ * (roll 1 of 3 targets = which target?) impossible to tell apart before.
+ * @param {Roll} roll
+ * @returns {string} "" if neither an actor nor a target could be resolved
+ */
+function _describeRollSource(roll) {
+  const parts = [];
+  const actorId = roll.data?.actorId ?? roll.actor?.id ?? null;
+  const actor = actorId ? (game.actors?.get(actorId) ?? null) : (roll.actor ?? null);
+  if (actor?.name) parts.push(actor.name);
+
+  const targetUuid = roll.data?.target ?? null;
+  if (targetUuid) {
+    try {
+      const target = fromUuidSync(targetUuid);
+      const targetName = target?.name ?? target?.actor?.name ?? null;
+      if (targetName) parts.push(`→ ${targetName}`);
+    } catch (err) {
+      console.warn("dice-fudger | failed to resolve roll target for labeling:", err, {targetUuid});
+    }
+  }
+  return parts.join(" ");
+}
+
 function _evaluateRollTotal(roll) {
   if (typeof roll._evaluateTotal === "function") return roll._evaluateTotal();
   if (typeof roll.total === "number") return roll.total;
@@ -977,13 +1005,21 @@ function _applyFudgedEventResources(events, message, roll, tracker) {
  * @returns {Promise<void>}
  */
 async function _reresolveRoll(roll) {
+  // The dice on `roll` may have just been edited directly (term.results[i].result mutated) without
+  // roll._total being refreshed yet - e.g. the manual "Fudge Roll" dialog does exactly this. Since
+  // resolveDamage() (below) determines Hit/Miss/Dodge/Resisted/Glance from the roll's current total,
+  // that total MUST be recomputed first, or resolveDamage silently re-derives the same pre-fudge
+  // outcome from the stale total and nothing appears to change (this was the root cause of fudged
+  // resisted/hit rolls not updating damage).
+  if (typeof roll._evaluateTotal === "function") roll._total = roll._evaluateTotal();
+  else _recomputeTotalFallback(roll);
+
   if (typeof roll.resolveDamage === "function") {
     const actor = roll.actor ?? (roll.data?.actorId ? game.actors.get(roll.data.actorId) : null);
     const target = roll.data?.target ? fromUuidSync(roll.data.target) : null;
     if (actor && target) {
       try {
         roll.resolveDamage(actor, target);
-        return;
       } catch (err) {
         console.warn("dice-fudger | resolveDamage() failed, falling back to a bare total recompute:", err);
       }
@@ -992,8 +1028,6 @@ async function _reresolveRoll(roll) {
         "The Hit/Miss badge and damage total on this card may not reflect the edit.");
     }
   }
-  if (typeof roll._evaluateTotal === "function") roll._total = roll._evaluateTotal();
-  else _recomputeTotalFallback(roll);
 }
 
 class DiceFudger {
@@ -1168,8 +1202,10 @@ class DiceFudger {
     </p>`;
 
     dice.forEach((d, i) => {
+      const source = _describeRollSource(d.roll);
+      const rollLabel = source ? `Roll ${d.rollIndex + 1} (${source})` : `Roll ${d.rollIndex + 1}`;
       const field = new NumberField({
-        label: `Roll ${d.rollIndex + 1} - die d${d.faces} (currently ${d.value})`,
+        label: `${rollLabel} - die d${d.faces} (currently ${d.value})`,
         min: 1, max: d.faces, step: 1, integer: true, required: true
       });
       field.name = `die${i}`;
