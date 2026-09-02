@@ -12,8 +12,17 @@ Dice Fudger is a Foundry VTT module for the Crucible system that lets the GM edi
 
 ## Compatibility
 
-- Verified for Foundry-compatible Crucible system version 0.10.1.
+- Verified for Crucible system version 0.10.2, on Foundry VTT 14 (build 367).
 - Declared compatibility with Foundry VTT 14.
+
+## Changelog
+
+### 0.0.5
+- Fixed: forcing/fudging a group check outcome updated the underlying roll data correctly but no
+  longer visibly updated the group check chat card. Crucible 0.10.2 nests the actual group check
+  flag data (`.actors`, `.aggregate`, etc.) one level deeper than before, under
+  `flags.crucible[GroupCheck.FLAG_KEY]` rather than `flags.crucible` directly - the module was
+  passing the wrong (too-shallow) object into Crucible's own card renderer, which failed silently.
 
 ## Installation
 

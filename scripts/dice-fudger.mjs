@@ -786,11 +786,20 @@ async function _renderGroupCheckContent(message) {
     ...(message.data?.flags ?? {}),
     ...(message.flags ?? {})
   };
-  // Crucible's renderGroupCheckCard expects the *inner* crucible-namespaced flag data
-  // (message.flags.crucible), not the raw Foundry flags wrapper `{crucible: {...}}` itself.
-  // Try the unwrapped shape first since that's what Crucible's own code expects; fall back to
-  // the raw wrapper in case a different Crucible version expects the outer object instead.
-  const flagCandidates = [rawFlags.crucible, rawFlags].filter(Boolean);
+  // Crucible's renderGroupCheckCard expects the *actual* GroupCheckFlags object - the one with
+  // .actors/.aggregate/etc - which as of Crucible 0.10.2 is nested one level deeper than the
+  // raw `flags.crucible` wrapper, under GroupCheck.FLAG_KEY (currently "groupCheck"):
+  //   message.flags.crucible[GroupCheck.FLAG_KEY]  ->  {actors, aggregate, skills, ...}
+  // Neither `flags.crucible` alone nor the raw `flags` wrapper has an `.actors` property, so
+  // passing either straight to renderGroupCheckCard throws inside Crucible's own code (caught
+  // below) and content silently fails to regenerate - which is what made fudged/forced group
+  // check outcomes edit the roll data correctly but never visibly update the chat card. Read
+  // FLAG_KEY off the class itself (rather than hardcoding "groupCheck") so this keeps working if
+  // a future Crucible version renames it, and keep the older/flatter shapes as fallbacks for
+  // resilience against other Crucible versions.
+  const crucibleFlags = rawFlags.crucible ?? {};
+  const flagKey = GroupCheck.FLAG_KEY ?? "groupCheck";
+  const flagCandidates = [crucibleFlags[flagKey], crucibleFlags, rawFlags].filter(Boolean);
   const rollObjects = message.rolls ?? [];
   const rollJson = rollObjects.map((roll) => typeof roll.toJSON === "function" ? roll.toJSON() : roll);
   for (const flags of flagCandidates) {
