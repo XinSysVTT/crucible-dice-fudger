@@ -27,6 +27,12 @@
  *    so multiplication, parentheses, keep/drop, etc. in other systems' formulas are handled
  *    correctly too. A manual +/- fallback is kept only for the unlikely case of a Foundry version
  *    where that private method doesn't exist.
+ *
+ * When a macro-armed "next roll" fudge cannot be applied (no DC/threshold data, the dice physically
+ * cannot reach the total the requested outcome needs, an unexpected error, or the qualifying roll
+ * having been made by another user on their own client so the GM-side interception never ran), the
+ * module posts a chat message whispered to every GM user explaining why. Toast notifications are
+ * transient and easy to miss mid-session; a GM whisper is persistent and never visible to players.
  */
 
 const MODULE_ID = "crucible-dice-fudger";
@@ -71,9 +77,7 @@ function _installSingleRollRigging() {
     // roll that actually matched. That's why "fudge next roll" often silently did nothing: with
     // more than one person at the table, something else almost always rolls first and ate the
     // arming before the intended roll ever happened.
-    const data = this.data ?? this.options?.data;
-    const looksLikeCrucibleCheck = data && ("dc" in data || "dc" in (data.data ?? {}));
-    if (!looksLikeCrucibleCheck) return result;
+    if (!_isFudgeableCheckRoll(this)) return result;
     if (armed.actorId) {
       const rollActorId = this.data?.actorId ?? this.options?.data?.actorId ?? null;
       if (rollActorId !== armed.actorId) return result; // not the targeted player - leave armed
@@ -85,17 +89,35 @@ function _installSingleRollRigging() {
       if (targetTotal === null) {
         console.warn("dice-fudger | roll has no dc/threshold data to force an outcome against - left unmodified.", {outcome, roll: this});
         ui.notifications.warn(`Dice Fudger: couldn't force this roll to ${OUTCOME_LABELS[outcome] ?? outcome} - it has no DC/threshold data. The roll was left unmodified.`);
+        _whisperGmFudgeFailure(armed, this, "the roll has no usable DC/threshold data to force the outcome against, so there was nothing to aim the fudge at. The roll was left unmodified.");
         return result;
       }
       const currentTotal = _evaluateRollTotal(this);
       if (currentTotal !== targetTotal) {
-        const edited = _assignDiceValuesToMatchTotal(this, targetTotal);
-        if (!edited && this._total !== targetTotal) this._total = targetTotal;
-        if (edited || typeof this.resolveDamage === "function") await _reresolveRoll(this);
+        const edit = _assignDiceValuesToMatchTotal(this, targetTotal);
+        if (!edit.edited && this._total !== targetTotal) this._total = targetTotal;
+        if (edit.edited || typeof this.resolveDamage === "function") await _reresolveRoll(this);
+        if (edit.clamped) {
+          const requestedLabel = OUTCOME_LABELS[outcome] ?? outcome;
+          const bounds = _outcomeBounds(this, outcome);
+          const actualBracket = _outcomeBracketForTotal(this, _evaluateRollTotal(this));
+          const actualLabel = actualBracket ? OUTCOME_LABELS[actualBracket] : null;
+          _whisperGmFudgeFailure(armed, this,
+            `the dice on this roll physically can't reach the total ${requestedLabel} requires ` +
+            `(needed ${bounds ? `${bounds.min}\u2013${bounds.max}` : `at least ${edit.requestedTotal}`}); ` +
+            `the closest achievable total (${edit.achievedTotal}) was used instead.`,
+            {detail: actualLabel && actualLabel !== requestedLabel
+              ? `The roll now reads as ${actualLabel} rather than the requested ${requestedLabel}.`
+              : `The roll still reads as ${requestedLabel}, just at the lower edge of what its dice allow.`}
+          );
+        }
       }
       console.debug("dice-fudger | rigged next single roll", {outcome, targetTotal, currentTotal, actorId: armed.actorId});
     } catch (err) {
       console.warn("dice-fudger | failed to rig next single roll:", err);
+      _whisperGmFudgeFailure(armed, this,
+        "an unexpected error occurred while editing the roll's dice - the roll may be partially modified or untouched. Check the roll's card.",
+        {detail: String(err?.message ?? err)});
     } finally {
       // Only reached once a roll actually qualified (right shape, right actor) and was
       // attempted - success or not - so this now only fires on the roll we were waiting for.
@@ -130,6 +152,127 @@ function _updateArmedIndicator() {
     document.body.appendChild(el);
   }
   el.textContent = `🎲 Next ${targetName ? `${targetName} roll` : "roll"} forced: ${OUTCOME_LABELS[outcome] ?? outcome} (click to cancel)`;
+}
+
+/**
+ * Post a chat message whispered to every GM user. The roll rigging only exists on the GM's client,
+ * and toast notifications are transient - if a fudge fires (or fails) mid-combat while the GM is
+ * looking elsewhere, the reason would be lost. A GM whisper is persistent, and whispered messages
+ * never appear in a player's chat log at all, so it stays private. Best-effort: never throws, so a
+ * messaging failure can't break the fudge flow itself.
+ * @param {string[]} lines  HTML lines to render inside the note
+ */
+function _postGmWhisper(lines) {
+  try {
+    const gmIds = game.users?.filter((u) => u.isGM).map((u) => u.id) ?? [];
+    if (!gmIds.length) return;
+    const content = lines.map((line) => `<p style="margin: 0.2em 0;">${line}</p>`).join("");
+    // No explicit author: ChatMessage's author field defaults to the creating user, which is what
+    // we want (only the GM client posts these). v13+ removed the old `user` create-data key.
+    ChatMessage.create({
+      whisper: gmIds,
+      speaker: {alias: "Dice Fudger"},
+      content: `<div class="dice-fudger-gm-note">${content}</div>`,
+      flags: {[MODULE_ID]: {gmFudgeFailureNote: true}}
+    });
+  } catch (err) {
+    console.warn("dice-fudger | failed to post the GM whisper about a fudge:", err);
+  }
+}
+
+/**
+ * Post a GM whisper explaining why an armed next-roll fudge could not be (fully) applied.
+ * @param {object|null} armed          The armed fudge state ({outcome, actorId}) being reported on
+ * @param {Roll|null} roll             The roll the fudge attempt was made against (for labeling)
+ * @param {string} reason              Why the fudge could not be applied as requested
+ * @param {object} [options]
+ * @param {string} [options.detail]    Optional extra line (e.g. what the roll actually landed as)
+ * @param {string} [options.rollLabel] Explicit label for the roll, when it can't be derived from
+ *                                     a Roll object (e.g. for a message that arrived from
+ *                                     another user's client)
+ */
+function _whisperGmFudgeFailure(armed, roll, reason, {detail = "", rollLabel = null} = {}) {
+  const outcomeLabel = OUTCOME_LABELS[armed?.outcome] ?? armed?.outcome ?? "an unknown outcome";
+  const targetName = armed?.actorId ? (game.actors?.get(armed.actorId)?.name ?? "an unknown actor") : null;
+  const label = rollLabel ?? (roll ? (_describeRollSource(roll) || "an unnamed roll") : "a roll");
+  _postGmWhisper([
+    `<strong>🎲 Dice Fudger - could not force ${outcomeLabel}${targetName ? ` for ${targetName}` : ""}</strong>`,
+    `Roll: <strong>${label}</strong>`,
+    `Reason: ${reason}`,
+    ...(detail ? [detail] : []),
+    `<em>The armed next-roll fudge has been cleared - arm it again if you still need it.</em>`
+  ]);
+}
+
+/**
+ * The single-roll rigging only exists on the GM's client (it is installed by DiceFudger.armNextRoll,
+ * which only the GM can run) - Roll.prototype.evaluate on a PLAYER's client is never patched, so a
+ * qualifying roll made by a player on their own machine posts its chat message without the fudge
+ * ever being attempted, and the armed state would otherwise sit there silently forever. Detect that
+ * case here as the message arrives. If the message is an unconfirmed action card or a
+ * blind/whispered (still hidden) roll and the auto-apply setting is on, the fudge is applied right
+ * away via the same code the "Force Outcome" buttons use; otherwise a GM whisper explains why it
+ * couldn't be applied and what the GM's options are. Runs on both createChatMessage and
+ * updateChatMessage, because some messages are posted empty and only get their rolls filled in by
+ * a later update.
+ * @param {ChatMessage} message
+ */
+async function _checkForeignRollAgainstArmedFudge(message) {
+  const armed = _pendingSingleRollOutcome;
+  if (!armed) return;
+  // Foundry v13+ renamed the message author field from `user` to `author` (message.user is gone),
+  // which silently made every incoming message look like our own and disabled this whole path.
+  // Handle both names, and fall back to the raw source id in case the author User no longer
+  // resolves (e.g. they left the server).
+  const authorId = message.author?.id ?? message._source?.author ?? message.user?.id ?? null;
+  if (!message || !authorId || authorId === game.user.id) return;
+  if (_isGroupCheckMessage(message)) return; // group checks have their own outcome-forcing path
+  const rolls = message.rolls ?? [];
+  const qualifyingRolls = rolls.filter((roll) => _isFudgeableCheckRoll(roll));
+  const matchingRolls = qualifyingRolls.filter((roll) => !armed.actorId ||
+    ((roll.data?.actorId ?? roll.options?.data?.actorId ?? null) === armed.actorId));
+  console.debug("dice-fudger | armed next-roll fudge saw a foreign chat message", {
+    messageId: message.id,
+    author: message.author?.name ?? authorId,
+    rollCount: rolls.length,
+    qualifyingCount: qualifyingRolls.length,
+    matchingCount: matchingRolls.length,
+    armedActorId: armed.actorId
+  });
+  if (!matchingRolls.length) return;
+
+  // The roll already resolved on another client - it can never be rigged during evaluate again.
+  // Consume the arming either way, then either apply the fudge now (while the message is still
+  // unconfirmed or hidden) or explain why that isn't possible.
+  _pendingSingleRollOutcome = null;
+  _updateArmedIndicator();
+  const rollerName = message.author?.name ?? message.user?.name ?? "another user";
+  const rollLabel = matchingRolls.map((r) => _describeRollSource(r)).filter(Boolean)[0] ?? "a qualifying roll";
+  const arrivalNote = `the roll was made by ${rollerName} on their own client. Dice Fudger's roll-time ` +
+    "interception only runs on the GM's client, so it never had a chance to edit the dice before the " +
+    "message was posted.";
+
+  const blind = message.blind ?? message.data?.blind ?? false;
+  const whispered = (message.whisper ?? message.data?.whisper ?? []).length > 0;
+  const pendingAction = _isPendingActionMessage(message);
+  const stillHidden = pendingAction || blind || whispered;
+
+  if (stillHidden && game.settings.get(MODULE_ID, "autoApplyArmedFudge")) {
+    // Deliberately silent apart from forceActionOutcome's own toast - the persistent chat-log note
+    // is reserved for cases that need the GM's attention (i.e. the fudge could NOT be applied).
+    await DiceFudger.forceActionOutcome(message, armed.outcome);
+    return;
+  }
+
+  const guidance = pendingAction
+    ? "It is an unconfirmed action card, so you can still apply the fudge yourself before confirming it: " +
+      "right-click the card and choose Fudge Roll (or use the Force buttons on the card, if that setting is enabled)."
+    : blind
+      ? "It is a blind roll, so you can still edit it manually before revealing it (right-click the message and choose Fudge Roll)."
+      : whispered
+        ? "It was rolled privately (whispered), so you may still be able to edit it manually before anyone else sees it (right-click the message and choose Fudge Roll)."
+        : "The result is already visible to the table, so editing it now would not be silent.";
+  _whisperGmFudgeFailure(armed, null, `${arrivalNote} ${guidance}`, {rollLabel});
 }
 
 /**
@@ -189,9 +332,7 @@ function _installRollRigging(outcome) {
   Roll.prototype.evaluate = async function(...args) {
     const result = await originalEvaluate.apply(this, args);
     try {
-      const data = this.data ?? this.options?.data;
-      const looksLikeCrucibleCheck = data && ("dc" in data || "dc" in (data.data ?? {}));
-      if (!looksLikeCrucibleCheck) return result;
+      if (!_isFudgeableCheckRoll(this)) return result;
       const participantOutcomes = _computeParticipantOutcomes(outcome, _pendingGroupCheckParticipantCount ?? 1);
       const participantIndex = _riggedParticipantIndex++;
       const rollOutcome = participantOutcomes[participantIndex] ?? outcome;
@@ -203,9 +344,9 @@ function _installRollRigging(outcome) {
       }
       const currentTotal = _evaluateRollTotal(this);
       if (currentTotal === targetTotal) return result;
-      const edited = _assignDiceValuesToMatchTotal(this, targetTotal);
-      if (!edited && this._total !== targetTotal) this._total = targetTotal;
-      if (edited || typeof this.resolveDamage === "function") await _reresolveRoll(this);
+      const edit = _assignDiceValuesToMatchTotal(this, targetTotal);
+      if (!edit.edited && this._total !== targetTotal) this._total = targetTotal;
+      if (edit.edited || typeof this.resolveDamage === "function") await _reresolveRoll(this);
       console.debug("dice-fudger | rigged roll pre-message", {outcome, rollOutcome, participantIndex, targetTotal, currentTotal});
     } catch (err) {
       console.warn("dice-fudger | failed to rig roll during evaluate:", err);
@@ -218,6 +359,8 @@ function _installRollRigging(outcome) {
 }
 
 Hooks.once("init", () => {
+  console.log(`dice-fudger | v${game.modules.get(MODULE_ID)?.version ?? "?"} initializing`);
+
   game.settings.register(MODULE_ID, "hideFromActiveModules", {
     name: "Hide from Active Modules",
     hint: "If enabled, this module's entry is removed from the Manage/View Modules list for non-GM users (players can open a read-only version of that list, not just GMs). This only hides the list entry - it does not stop a player from seeing this module is installed via the browser console (game.modules) or network requests for its files.",
@@ -234,6 +377,15 @@ Hooks.once("init", () => {
     config: true,
     type: Boolean,
     default: false
+  });
+
+  game.settings.register(MODULE_ID, "autoApplyArmedFudge", {
+    name: "Auto-Apply Armed Next-Roll Fudges to Player-Made Rolls",
+    hint: "The Fudge Next Roll macros can only intercept rolls evaluated on the GM's own client. Rolls made by players on their own clients are already posted by the time the GM sees them. If enabled, an armed fudge is applied automatically when such a message arrives - but only while it can still be done before the outcome matters: an unconfirmed action card (edited before you click Confirm) or a blind/whispered roll that players can't see yet. Successful applications are announced only with a brief toast notification; when a fudge cannot be applied (this setting is off, or the roll was already public), a private GM-whispered chat note explains why and what your options are.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true
   });
 });
 
@@ -352,6 +504,9 @@ Hooks.once("ready", () => {
 
 Hooks.on("createChatMessage", async (message) => {
   if (!game.user.isGM) return;
+  // A qualifying roll that just arrived from a DIFFERENT user means the GM-side interception never
+  // ran for it (see _checkForeignRollAgainstArmedFudge) - apply it if still possible, or report.
+  await _checkForeignRollAgainstArmedFudge(message);
   const outcome = _pendingGroupCheckOutcome;
   if (!outcome) return;
   console.debug("dice-fudger | createChatMessage saw pending outcome", {
@@ -373,6 +528,9 @@ Hooks.on("createChatMessage", async (message) => {
 
 Hooks.on("updateChatMessage", async (message) => {
   if (!game.user.isGM) return;
+  // Messages posted empty and filled in by a later update can also be the first time the GM client
+  // sees a foreign qualifying roll, so re-check the armed fudge here too.
+  await _checkForeignRollAgainstArmedFudge(message);
   const outcome = _pendingGroupCheckMessages.get(message.id);
   if (!outcome) return;
   console.debug("dice-fudger | updateChatMessage saw queued outcome", {
@@ -537,11 +695,13 @@ function _getEditableDiceFromRoll(roll) {
  */
 function _describeRollSource(roll) {
   const parts = [];
-  const actorId = roll.data?.actorId ?? roll.actor?.id ?? null;
+  // Rolls reconstructed from another user's chat message keep their custom data under
+  // `options.data` rather than `data`, so check both when resolving actor/target labels.
+  const actorId = roll.data?.actorId ?? roll.options?.data?.actorId ?? roll.actor?.id ?? null;
   const actor = actorId ? (game.actors?.get(actorId) ?? null) : (roll.actor ?? null);
   if (actor?.name) parts.push(actor.name);
 
-  const targetUuid = roll.data?.target ?? null;
+  const targetUuid = roll.data?.target ?? roll.options?.data?.target ?? null;
   if (targetUuid) {
     try {
       const target = fromUuidSync(targetUuid);
@@ -552,6 +712,22 @@ function _describeRollSource(roll) {
     }
   }
   return parts.join(" ");
+}
+
+/**
+ * Whether a Roll looks like a Crucible check that an outcome fudge can act on. StandardCheck-style
+ * checks and AttackRolls carry a `dc` on their roll data (AttackRoll.defaultData inherits it and
+ * its overflow getter reads it); AttackRoll additionally exposes resolveDamage(), which also covers
+ * rolls reconstructed from another user's chat message - Roll.fromData rebuilds the registered
+ * system subclass (Crucible pushes its classes into CONFIG.Dice.rolls), so the method survives the
+ * round-trip even if a future version ever dropped dc from the serialized data.
+ * @param {Roll} roll
+ * @returns {boolean}
+ */
+function _isFudgeableCheckRoll(roll) {
+  if (!roll?._evaluated) return false;
+  const data = roll.data ?? roll.options?.data ?? {};
+  return ("dc" in data) || ("dc" in (data.data ?? {})) || typeof roll.resolveDamage === "function";
 }
 
 function _evaluateRollTotal(roll) {
@@ -737,7 +913,17 @@ function _parseCheckMetadata(roll) {
   return {dc, criticalSuccessThreshold, criticalFailureThreshold};
 }
 
-function _chooseGroupOutcomeTotal(roll, outcome) {
+/**
+ * The total range a given outcome bracket occupies for a roll, using the same bracket bounds
+ * Crucible's StandardCheck getters use (success = dc+1 upward, critical success = dc plus the
+ * critical success threshold, failure = dc downward through the critical failure threshold).
+ * Split out of _chooseGroupOutcomeTotal so the next-roll fudge's failure reporting can show the
+ * GM the range the requested outcome actually needed.
+ * @param {Roll} roll
+ * @param {string} outcome  "criticalSuccess"|"success"|"failure"|"criticalFailure"
+ * @returns {{min: number, max: number}|null} null if the roll's dc/threshold data is unusable
+ */
+function _outcomeBounds(roll, outcome) {
   const {dc, criticalSuccessThreshold, criticalFailureThreshold} = _parseCheckMetadata(roll);
   if (!Number.isFinite(dc) || !Number.isFinite(criticalSuccessThreshold) || !Number.isFinite(criticalFailureThreshold)) return null;
   const successMin = dc + 1;
@@ -751,16 +937,38 @@ function _chooseGroupOutcomeTotal(roll, outcome) {
 
   switch (outcome) {
     case "criticalSuccess":
-      return _randomInt(criticalSuccessMin, criticalSuccessMax);
+      return {min: criticalSuccessMin, max: criticalSuccessMax};
     case "success":
-      return _randomInt(successMin, successMax);
+      return {min: successMin, max: successMax};
     case "failure":
-      return _randomInt(failureMin, failureMax);
+      return {min: failureMin, max: failureMax};
     case "criticalFailure":
-      return _randomInt(criticalFailureMin, criticalFailureMax);
+      return {min: criticalFailureMin, max: criticalFailureMax};
     default:
       return null;
   }
+}
+
+function _chooseGroupOutcomeTotal(roll, outcome) {
+  const bounds = _outcomeBounds(roll, outcome);
+  if (!bounds) return null;
+  return _randomInt(bounds.min, bounds.max);
+}
+
+/**
+ * The inverse of _outcomeBounds: which outcome bracket a finished total falls into for this roll.
+ * Used to tell the GM what a clamped (physically unreachable) fudge actually landed as.
+ * @param {Roll} roll
+ * @param {number} total
+ * @returns {string|null} an OUTCOME_LABELS key, or null if the roll's dc data is unusable
+ */
+function _outcomeBracketForTotal(roll, total) {
+  const {dc, criticalSuccessThreshold, criticalFailureThreshold} = _parseCheckMetadata(roll);
+  if (!Number.isFinite(dc) || !Number.isFinite(criticalSuccessThreshold) || !Number.isFinite(criticalFailureThreshold)) return null;
+  if (total >= dc + criticalSuccessThreshold) return "criticalSuccess";
+  if (total > dc) return "success";
+  if (total >= dc - (criticalFailureThreshold - 1)) return "failure";
+  return "criticalFailure";
 }
 
 function _randomInt(min, max) {
@@ -853,14 +1061,15 @@ function _isGroupCheckMessage(message) {
 
 function _assignDiceValuesToMatchTotal(roll, targetTotal) {
   const entries = _getEditableDiceFromRoll(roll);
-  if (!entries.length) return false;
+  if (!entries.length) return {edited: false, clamped: false};
   const currentTotal = _evaluateRollTotal(roll);
   const currentDiceTotal = entries.reduce((sum, e) => sum + Number(e.value), 0);
   const fixedTotal = currentTotal - currentDiceTotal;
   const targetDiceTotal = targetTotal - fixedTotal;
   const faces = entries.map((e) => e.faces);
   const {values, requestedSum, achievedSum} = _distributeSumAcrossDice(faces, targetDiceTotal);
-  if (achievedSum !== requestedSum) {
+  const clamped = achievedSum !== requestedSum;
+  if (clamped) {
     const achievedTotal = achievedSum + fixedTotal;
     console.warn("dice-fudger | requested total is outside what these dice can physically produce - clamped to " +
       "the nearest achievable value.", {requestedTotal: targetTotal, achievedTotal, faces});
@@ -882,7 +1091,7 @@ function _assignDiceValuesToMatchTotal(roll, targetTotal) {
     roll.data.total = roll._total;
     if ("result" in roll.data) roll.data.result = roll._total;
   }
-  return true;
+  return {edited: true, clamped, requestedTotal: targetTotal, achievedTotal: achievedSum + fixedTotal};
 }
 
 /**
@@ -1314,12 +1523,12 @@ class DiceFudger {
       const currentTotal = _evaluateRollTotal(roll);
       console.debug("dice-fudger | group outcome", {outcome, rollOutcome, targetTotal, currentTotal, roll});
       if (currentTotal === targetTotal) return;
-      const edited = _assignDiceValuesToMatchTotal(roll, targetTotal);
-      if (!edited && roll._total !== targetTotal) {
+      const edit = _assignDiceValuesToMatchTotal(roll, targetTotal);
+      if (!edit.edited && roll._total !== targetTotal) {
         roll._total = targetTotal;
       }
       changedRolls.add(roll);
-      if (edited || typeof roll.resolveDamage === "function") {
+      if (edit.edited || typeof roll.resolveDamage === "function") {
         rollsNeedingReresolve.add(roll);
       }
     });
@@ -1401,10 +1610,10 @@ class DiceFudger {
       }
       const currentTotal = _evaluateRollTotal(roll);
       if (currentTotal === targetTotal) continue;
-      const edited = _assignDiceValuesToMatchTotal(roll, targetTotal);
-      if (!edited && roll._total !== targetTotal) roll._total = targetTotal;
+      const edit = _assignDiceValuesToMatchTotal(roll, targetTotal);
+      if (!edit.edited && roll._total !== targetTotal) roll._total = targetTotal;
       changedRolls.add(roll);
-      if (edited || typeof roll.resolveDamage === "function") rollsNeedingReresolve.add(roll);
+      if (edit.edited || typeof roll.resolveDamage === "function") rollsNeedingReresolve.add(roll);
     }
 
     if (unresolvableCount > 0) {

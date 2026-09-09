@@ -104,3 +104,20 @@
 .dice-fudger-armed-indicator:hover {
   background: rgba(150, 30, 30, 0.95);
 }
+
+/* GM-whispered "fudge could not be applied" notes (see _whisperGmFudgeFailure). Kept visually
+   distinct from normal chat cards so the GM can spot them while scrolling back. */
+.dice-fudger-gm-note {
+  border-left: 3px solid #b8863f;
+  background: rgba(30, 22, 12, 0.85);
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  font-size: var(--font-size-13, 13px);
+}
+.dice-fudger-gm-note p:first-child {
+  color: #ffd98a;
+}
+.dice-fudger-gm-note p:last-child {
+  color: rgba(255, 235, 200, 0.8);
+  font-size: var(--font-size-11, 11px);
+}
