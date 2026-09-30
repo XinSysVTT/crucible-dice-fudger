@@ -27,6 +27,15 @@
  *    so multiplication, parentheses, keep/drop, etc. in other systems' formulas are handled
  *    correctly too. A manual +/- fallback is kept only for the unlikely case of a Foundry version
  *    where that private method doesn't exist.
+ *  - Crucible's confirm-time spell/strike animations are NOT derived from the rolls at confirm:
+ *    they are baked into `message.flags.crucible.vfxConfig` when the card is first created (from
+ *    the pre-fudge results) and played verbatim from that frozen flag on every client. So after
+ *    fudging an action card's rolls (Force buttons, Fudge Roll dialog, or an auto-applied armed
+ *    fudge), this module reconstructs the action from the corrected message
+ *    (CrucibleAction.fromChatMessage) and re-runs configureVFXEffect() to rebuild that flag -
+ *    otherwise a spell forced to succeed still played the resist air-puff (and a strike forced to
+ *    a hit still played its dodge/miss treatment) the moment the GM confirmed the card.
+ *    See _refreshActionVfxConfig.
  *
  * When a macro-armed "next roll" fudge cannot be applied (no DC/threshold data, the dice physically
  * cannot reach the total the requested outcome needs, an unexpected error, or the qualifying roll
@@ -1248,6 +1257,68 @@ async function _reresolveRoll(roll) {
   }
 }
 
+/**
+ * Locate Crucible's CrucibleAction model class, following the same lookup strategy as
+ * _getGroupCheckClass (the system exposes it as game.system.api.models.CrucibleAction).
+ * @returns {Function|null}
+ */
+function _getCrucibleActionClass() {
+  return globalThis.crucible?.api?.models?.CrucibleAction
+    ?? window?.crucible?.api?.models?.CrucibleAction
+    ?? game.system?.api?.models?.CrucibleAction
+    ?? null;
+}
+
+/**
+ * Rebuild the frozen spell/strike animation config (message.flags.crucible.vfxConfig) on a Crucible
+ * action card after its rolls have been fudged, so the confirm-time animation matches the forced
+ * outcome instead of the pre-fudge one.
+ *
+ * Root cause of "fudged the spell to hit but the target still plays the resist animation": Crucible
+ * bakes the per-target impact animations (hit burst + recoil vs the resist air-puff), the scrolling
+ * text, and the projectile geometry into a serialized VFXEffect at the moment the action's chat
+ * message is CREATED (CrucibleAction#_prepareMessage -> #configureVFXEffect), freezing whatever the
+ * rolls' results were before any fudge could happen. Confirming never re-derives anything from the
+ * rolls - CrucibleChatMessage#playVFXEffect plays flags.crucible.vfxConfig verbatim, on every client.
+ * So a spell fudged from Resist to Hit still played the resist puff (the same reason a strike fudged
+ * from Dodge to Hit still played its dodge treatment).
+ *
+ * CrucibleAction.fromChatMessage reconstructs the action with the LIVE (already-corrected) rolls and
+ * the corrected event stream read back from the message, and configureVFXEffect() re-runs the exact
+ * tag-driven builders Crucible used originally - so re-running it here and saving the result back
+ * into the flag makes the confirm animation match the fudged outcome for every client (playback on
+ * all clients reads this same shared flag).
+ *
+ * Only pending (not-yet-confirmed) cards are refreshed: the animation has already played on a
+ * confirmed card, and Crucible only triggers playback on the unconfirmed->confirmed update, so
+ * refreshing the flag there would be pointless work. Best-effort: any failure leaves the original
+ * flag untouched (the animation may then still show the pre-fudge result, as before this fix).
+ * @param {ChatMessage} message  A message whose rolls/events have just been updated by a fudge
+ */
+async function _refreshActionVfxConfig(message) {
+  const flags = message?.flags?.crucible ?? message?.data?.flags?.crucible;
+  if (!flags?.action || !flags.vfxConfig) return;
+  if (flags.confirmed) return;
+  const CrucibleAction = _getCrucibleActionClass();
+  if (!CrucibleAction || typeof CrucibleAction.fromChatMessage !== "function") return;
+  let config = null;
+  try {
+    const action = CrucibleAction.fromChatMessage(message);
+    config = (action && typeof action.configureVFXEffect === "function") ? action.configureVFXEffect() : null;
+  } catch (err) {
+    console.warn("dice-fudger | failed to rebuild the action's VFX config after fudging - the confirm " +
+      "animation may still show the pre-fudge result:", err);
+    return;
+  }
+  if (!config) return; // e.g. a non-animated action, or no VFX for this rune/gesture - keep as-is
+  try {
+    await message.update({"flags.crucible.vfxConfig": config}, {diff: false});
+  } catch (err) {
+    console.warn("dice-fudger | failed to save the rebuilt VFX config onto the action card - the confirm " +
+      "animation may still show the pre-fudge result:", err);
+  }
+}
+
 class DiceFudger {
   /**
    * Arm a roll to be forced into the given outcome bracket the next time it happens. By default
@@ -1493,6 +1564,9 @@ class DiceFudger {
     if (tracker.changed) updateData["flags.crucible.events"] = events;
 
     await message.update(updateData, {diff: false});
+    // Same concern as forceActionOutcome: refresh the frozen confirm-time animation config so the
+    // hand-edited dice produce a matching hit/resist animation when the card is confirmed.
+    await _refreshActionVfxConfig(message);
     ui.notifications.info("Roll fudged. Use Foundry's \"Reveal Message\" option when you're ready to show it.");
   }
 
@@ -1642,6 +1716,11 @@ class DiceFudger {
     };
     if (tracker.changed) updateData["flags.crucible.events"] = events;
     await message.update(updateData, {diff: false});
+
+    // The confirm-time spell/strike animation is baked into flags.crucible.vfxConfig when the card is
+    // first created (from the PRE-fudge results) and played verbatim on confirm - rebuild it from the
+    // now-corrected rolls so a fudged hit doesn't still play the resist/miss animation.
+    await _refreshActionVfxConfig(message);
 
     ui.notifications.info(`Forced action outcome: ${OUTCOME_LABELS[outcome] ?? outcome}.`);
     return true;

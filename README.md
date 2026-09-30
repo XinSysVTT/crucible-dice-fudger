@@ -17,6 +17,17 @@ Dice Fudger is a Foundry VTT module for the Crucible system that lets the GM edi
 
 ## Changelog
 
+### 0.0.10
+- Fixed: fudging a spell (or weapon strike) action card to succeed - via the Force Outcome buttons,
+  the Fudge Roll dialog, or an auto-applied armed fudge - still played the **resist/miss animation**
+  when the card was confirmed. Crucible bakes the per-target confirm-time animation (hit burst vs
+  the resist air-puff, scrolling text, projectile geometry) into `flags.crucible.vfxConfig` when the
+  card is first created, from the PRE-fudge roll results, and plays that frozen config verbatim on
+  confirm - it never re-derives anything from the rolls. The module now rebuilds that config from
+  the corrected message (via Crucible's own `CrucibleAction.fromChatMessage` + `configureVFXEffect`)
+  after fudging a not-yet-confirmed action card, so the confirm animation matches the forced
+  outcome on every client.
+
 ### 0.0.9
 - Changed: the GM-whispered "Dice Fudger" chat note now only appears when an armed fudge could NOT
   be applied (or was clamped/errored) - i.e. when the GM needs to know something. Successful
