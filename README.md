@@ -17,7 +17,7 @@ Dice Fudger is a Foundry VTT module for the Crucible system that lets the GM edi
 
 ## Changelog
 
-### 0.0.10
+### 0.1.0
 - Fixed: fudging a spell (or weapon strike) action card to succeed - via the Force Outcome buttons,
   the Fudge Roll dialog, or an auto-applied armed fudge - still played the **resist/miss animation**
   when the card was confirmed. Crucible bakes the per-target confirm-time animation (hit burst vs
