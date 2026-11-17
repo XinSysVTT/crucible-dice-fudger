@@ -12,10 +12,16 @@ Dice Fudger is a Foundry VTT module for the Crucible system that lets the GM edi
 
 ## Compatibility
 
-- Verified for Crucible system version 0.10.2, on Foundry VTT 14 (build 367).
+- Verified for Crucible system version 0.11.3, on Foundry VTT 14 (build 370+).
 - Declared compatibility with Foundry VTT 14.
 
 ## Changelog
+
+### 0.1.1
+- Fixed: Critical Success / Critical Failure outcome bounds were off by one relative to Crucible's `StandardCheck` getters (`total > dc + criticalSuccessThreshold` and `total <= dc - criticalFailureThreshold`), which could cause a forced Critical Success to land on `dc + threshold` (evaluated as a plain Success by Crucible).
+- Fixed: reversed action cards (`flags.crucible.reversed`) are no longer treated as pending/unconfirmed actions.
+- Fixed: `event.isCriticalSuccess` and `event.isCriticalFailure` in `flags.crucible.events` (Crucible 0.11.x) are now kept in sync when a roll is fudged into or out of a critical bracket.
+- Changed: migrated the remaining ApplicationV1 `Dialog` prompts to Foundry's `DialogV2.wait`.
 
 ### 0.1.0
 - Fixed: fudging a spell (or weapon strike) action card to succeed - via the Force Outcome buttons,

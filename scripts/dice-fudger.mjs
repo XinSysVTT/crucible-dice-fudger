@@ -577,31 +577,9 @@ Hooks.on("getChatMessageContextOptions", (message, options) => {
     onClick: async (_event, li) => {
       const msg = _resolveMessage(li);
       if (!msg) return;
-      const outcome = await new Promise((resolve) => {
-        new Dialog({
-          title: "Force Group Outcome",
-          content: "<p>Select the desired group outcome.</p>",
-          buttons: {
-            criticalSuccess: {
-              label: "Critical Success",
-              callback: () => resolve("criticalSuccess")
-            },
-            success: {
-              label: "Success",
-              callback: () => resolve("success")
-            },
-            failure: {
-              label: "Failure",
-              callback: () => resolve("failure")
-            },
-            criticalFailure: {
-              label: "Critical Failure",
-              callback: () => resolve("criticalFailure")
-            }
-          },
-          default: "success",
-          close: () => resolve(null)
-        }).render(true);
+      const outcome = await _promptOutcomeDialog({
+        title: "Force Group Outcome",
+        content: "<p>Select the desired group outcome.</p>"
       });
       if (outcome) await DiceFudger.forceGroupOutcome(msg, outcome);
     }
@@ -844,7 +822,7 @@ function _buildGroupOutcomeButtons(html, message) {
 function _isPendingActionMessage(message) {
   const flags = message?.flags?.crucible ?? message?.data?.flags?.crucible;
   if (!flags || !("action" in flags)) return false;
-  if (flags.confirmed !== false) return false; // already confirmed, or not an action that tracks confirmation
+  if (flags.confirmed !== false || flags.reversed) return false; // confirmed, reversed, or not tracking confirmation
   return !!message.rolls?.length;
 }
 
@@ -936,12 +914,12 @@ function _outcomeBounds(roll, outcome) {
   const {dc, criticalSuccessThreshold, criticalFailureThreshold} = _parseCheckMetadata(roll);
   if (!Number.isFinite(dc) || !Number.isFinite(criticalSuccessThreshold) || !Number.isFinite(criticalFailureThreshold)) return null;
   const successMin = dc + 1;
-  const criticalSuccessMin = dc + criticalSuccessThreshold;
+  const criticalSuccessMin = dc + criticalSuccessThreshold + 1; // StandardCheck#isCriticalSuccess uses strictly `>`
   const successMax = Math.max(successMin, criticalSuccessMin - 1);
   const criticalSuccessMax = Math.max(criticalSuccessMin, criticalSuccessMin + 5);
   const failureMin = Math.max(-(2 ** 31), dc - (criticalFailureThreshold - 1));
   const failureMax = dc;
-  const criticalFailureMax = Math.min(failureMax - 1, dc - criticalFailureThreshold - 1);
+  const criticalFailureMax = Math.min(failureMax - 1, dc - criticalFailureThreshold); // StandardCheck#isCriticalFailure uses `<=`
   const criticalFailureMin = Math.max(-(2 ** 31), criticalFailureMax - 5);
 
   switch (outcome) {
@@ -974,7 +952,7 @@ function _chooseGroupOutcomeTotal(roll, outcome) {
 function _outcomeBracketForTotal(roll, total) {
   const {dc, criticalSuccessThreshold, criticalFailureThreshold} = _parseCheckMetadata(roll);
   if (!Number.isFinite(dc) || !Number.isFinite(criticalSuccessThreshold) || !Number.isFinite(criticalFailureThreshold)) return null;
-  if (total >= dc + criticalSuccessThreshold) return "criticalSuccess";
+  if (total > dc + criticalSuccessThreshold) return "criticalSuccess";
   if (total > dc) return "success";
   if (total >= dc - (criticalFailureThreshold - 1)) return "failure";
   return "criticalFailure";
@@ -1198,10 +1176,29 @@ function _applyFudgedEventResources(events, message, roll, tracker) {
   const rollIndex = message.rolls?.indexOf(roll);
   if (rollIndex == null || rollIndex < 0) return events;
   const recomputed = _recomputeCrucibleEventResourceForRoll(roll);
-  if (!recomputed) return events; // no (non-harmless) damage on this roll - nothing to correct here
+  const bracket = typeof roll.isCriticalSuccess === "boolean" || typeof roll.isCriticalFailure === "boolean"
+    ? (roll.isCriticalSuccess ? "criticalSuccess" : roll.isCriticalFailure ? "criticalFailure" : null)
+    : _outcomeBracketForTotal(roll, _evaluateRollTotal(roll));
+  const isCritSuccess = bracket === "criticalSuccess";
+  const isCritFailure = bracket === "criticalFailure";
+
   return events.map((event) => {
     if (event?.rollIndex !== rollIndex) return event;
-    const resources = Array.isArray(event.resources) ? event.resources : [];
+    let updated = event;
+
+    // Crucible 0.11.x freezes event.isCriticalSuccess / isCriticalFailure into flags.crucible.events
+    // at creation; keep them in sync when a roll is fudged into or out of a critical bracket.
+    if (Boolean(updated.isCriticalSuccess) !== isCritSuccess || Boolean(updated.isCriticalFailure) !== isCritFailure) {
+      updated = {...updated};
+      if (isCritSuccess) updated.isCriticalSuccess = true;
+      else delete updated.isCriticalSuccess;
+      if (isCritFailure) updated.isCriticalFailure = true;
+      else delete updated.isCriticalFailure;
+      tracker.changed = true;
+    }
+
+    if (!recomputed) return updated; // no (non-harmless) damage on this roll - nothing else to correct here
+    const resources = Array.isArray(updated.resources) ? updated.resources : [];
     if (resources.length > 1) {
       console.warn("dice-fudger | this roll's confirmed damage event has more than one recorded resource change " +
         "(likely pool overflow or a linked resource) from Crucible's own resolution - leaving " +
@@ -1210,10 +1207,10 @@ function _applyFudgedEventResources(events, message, roll, tracker) {
       ui.notifications.warn("Dice Fudger: this roll's damage involves more than one resource (e.g. pool " +
         "overflow) - the fudge to the roll total was applied, but the confirmed damage amount could not be " +
         "safely corrected and may still show the original value.");
-      return event;
+      return updated;
     }
     tracker.changed = true;
-    return {...event, resources: [recomputed]};
+    return {...updated, resources: [recomputed]};
   });
 }
 
@@ -1319,6 +1316,38 @@ async function _refreshActionVfxConfig(message) {
   }
 }
 
+/**
+ * Show a DialogV2 outcome-picker prompt and return the chosen action/value, or null if dismissed.
+ * @param {object} options
+ * @param {string} options.title
+ * @param {string} options.content
+ * @param {string} [options.defaultAction="success"]
+ * @param {Function} [options.mapResult]  Optional `(action, button) => value` mapper
+ * @param {object[]} [options.extraButtons=[]]  Additional DialogV2 button descriptors
+ * @returns {Promise<*>}
+ */
+async function _promptOutcomeDialog({title, content, defaultAction = "success", mapResult, extraButtons = []}) {
+  const buttons = [
+    ...FORCE_OUTCOME_BUTTONS.map((b) => ({
+      action: b.action,
+      label: b.label,
+      default: b.action === defaultAction,
+      callback: (_event, button) => mapResult ? mapResult(b.action, button) : b.action
+    })),
+    ...extraButtons
+  ];
+  try {
+    return await foundry.applications.api.DialogV2.wait({
+      window: {title},
+      content,
+      buttons,
+      rejectClose: false
+    });
+  } catch {
+    return null;
+  }
+}
+
 class DiceFudger {
   /**
    * Arm a roll to be forced into the given outcome bracket the next time it happens. By default
@@ -1360,20 +1389,14 @@ class DiceFudger {
       ui.notifications.warn("Only the GM can fudge rolls.");
       return;
     }
-    const outcome = await new Promise((resolve) => {
-      new Dialog({
-        title: "Fudge Next Roll (Anyone)",
-        content: "<p>Force the very next qualifying roll (skill check, save, attack, etc.) from anyone at the table to a specific outcome.</p>",
-        buttons: {
-          criticalSuccess: {label: "Critical Success", callback: () => resolve("criticalSuccess")},
-          success: {label: "Success", callback: () => resolve("success")},
-          failure: {label: "Failure", callback: () => resolve("failure")},
-          criticalFailure: {label: "Critical Failure", callback: () => resolve("criticalFailure")},
-          cancel: {label: "Cancel Armed Fudge", callback: () => resolve("__cancel__")}
-        },
-        default: "success",
-        close: () => resolve(null)
-      }).render(true);
+    const outcome = await _promptOutcomeDialog({
+      title: "Fudge Next Roll (Anyone)",
+      content: "<p>Force the very next qualifying roll (skill check, save, attack, etc.) from anyone at the table to a specific outcome.</p>",
+      extraButtons: [{
+        action: "cancel",
+        label: "Cancel Armed Fudge",
+        callback: () => "__cancel__"
+      }]
     });
     if (outcome === "__cancel__") {
       _pendingSingleRollOutcome = null;
@@ -1414,21 +1437,16 @@ class DiceFudger {
         </select>
       </div>
     `;
-    const readTarget = (html) => _toJQuery(html).find("#dice-fudger-target-actor").val() || null;
-    const result = await new Promise((resolve) => {
-      new Dialog({
-        title: "Fudge Next Roll (Choose Player)",
-        content,
-        buttons: {
-          criticalSuccess: {label: "Critical Success", callback: (html) => resolve({outcome: "criticalSuccess", actorId: readTarget(html)})},
-          success: {label: "Success", callback: (html) => resolve({outcome: "success", actorId: readTarget(html)})},
-          failure: {label: "Failure", callback: (html) => resolve({outcome: "failure", actorId: readTarget(html)})},
-          criticalFailure: {label: "Critical Failure", callback: (html) => resolve({outcome: "criticalFailure", actorId: readTarget(html)})},
-          cancel: {label: "Cancel Armed Fudge", callback: () => resolve("__cancel__")}
-        },
-        default: "success",
-        close: () => resolve(null)
-      }).render(true);
+    const readTarget = (button) => button?.form?.querySelector("#dice-fudger-target-actor")?.value || null;
+    const result = await _promptOutcomeDialog({
+      title: "Fudge Next Roll (Choose Player)",
+      content,
+      mapResult: (outcome, button) => ({outcome, actorId: readTarget(button)}),
+      extraButtons: [{
+        action: "cancel",
+        label: "Cancel Armed Fudge",
+        callback: () => "__cancel__"
+      }]
     });
     if (result === "__cancel__") {
       _pendingSingleRollOutcome = null;
@@ -1440,35 +1458,16 @@ class DiceFudger {
   }
 
   static async promptPreRollOutcome() {
-    return new Promise((resolve) => {
-      new Dialog({
-        title: "Force Group Check Outcome",
-        content: "<p>Apply a forced outcome to the next group check you configure?</p>",
-        buttons: {
-          criticalSuccess: {
-            label: "Critical Success",
-            callback: () => resolve("criticalSuccess")
-          },
-          success: {
-            label: "Success",
-            callback: () => resolve("success")
-          },
-          failure: {
-            label: "Failure",
-            callback: () => resolve("failure")
-          },
-          criticalFailure: {
-            label: "Critical Failure",
-            callback: () => resolve("criticalFailure")
-          },
-          none: {
-            label: "None",
-            callback: () => resolve(null)
-          }
-        },
-        default: "none",
-        close: () => resolve(null)
-      }).render(true);
+    return _promptOutcomeDialog({
+      title: "Force Group Check Outcome",
+      content: "<p>Apply a forced outcome to the next group check you configure?</p>",
+      defaultAction: "none",
+      extraButtons: [{
+        action: "none",
+        label: "None",
+        default: true,
+        callback: () => null
+      }]
     });
   }
 
